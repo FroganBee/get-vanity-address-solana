@@ -1,23 +1,37 @@
 use clap::Parser;
 use rayon::prelude::*;
-use solana_sdk::signature::{Keypair, Signer};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use std::fs;
 use serde_json::{json, to_string_pretty};
 use chrono::{DateTime, Utc};
+use bip39::{Mnemonic, Language};
+use secp256k1::{Secp256k1, SecretKey, PublicKey};
+use sha3::{Digest, Keccak256};
+use bitcoin::{
+    Address, Network, PrivateKey, PublicKey as BtcPublicKey,
+    secp256k1::{Secp256k1 as BtcSecp256k1, SecretKey as BtcSecretKey},
+};
+use base58::ToBase58;
+use ripemd::Ripemd160;
+use sha2::Sha256;
+use rand::RngCore;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// Blockchain type: btc, eth, xrp, or sol
+    #[arg(short, long, default_value = "sol")]
+    chain: String,
+
     /// The pattern to search for at the beginning of the address
     #[arg(short, long)]
     prefix: Option<String>,
 
     /// The pattern to search for at the end of the address
-    #[arg(short, long, default_value = "pump")]
-    suffix: String,
+    #[arg(short, long)]
+    suffix: Option<String>,
 
     /// Number of threads to use (0 = auto-detect)
     #[arg(short, long, default_value_t = 0)]
@@ -78,13 +92,7 @@ impl OptimizedPattern {
             return false;
         }
         
-        // Use unchecked slicing for better performance in release builds
-        #[cfg(debug_assertions)]
         let text_slice = &text[..self.pattern_len];
-        #[cfg(not(debug_assertions))]
-        let text_slice = unsafe { 
-            text.get_unchecked(..self.pattern_len) 
-        };
         
         match self.case_mode.as_str() {
             "exact" => text_slice == self.exact,
@@ -101,13 +109,7 @@ impl OptimizedPattern {
             return false;
         }
         
-        // Use unchecked slicing for better performance in release builds
-        #[cfg(debug_assertions)]
         let text_slice = &text[text.len() - self.pattern_len..];
-        #[cfg(not(debug_assertions))]
-        let text_slice = unsafe { 
-            text.get_unchecked(text.len() - self.pattern_len..) 
-        };
         
         match self.case_mode.as_str() {
             "exact" => text_slice == self.exact,
@@ -124,45 +126,192 @@ impl OptimizedPattern {
             return false;
         }
         
-        // Fast byte-by-byte comparison for mixed case
         let pattern_bytes = self.exact.as_bytes();
         let text_bytes = text_slice.as_bytes();
         
-        // Use unchecked access for better performance in release builds
-        #[cfg(debug_assertions)]
-        {
-            for i in 0..self.pattern_len {
-                let pattern_char = pattern_bytes[i];
-                let text_char = text_bytes[i];
-                
-                // If pattern char is uppercase, text char must be uppercase
-                if pattern_char.is_ascii_uppercase() && !text_char.is_ascii_uppercase() {
-                    return false;
-                }
-                // If pattern char is lowercase, text char must be lowercase
-                if pattern_char.is_ascii_lowercase() && !text_char.is_ascii_lowercase() {
-                    return false;
-                }
+        for i in 0..self.pattern_len {
+            let pattern_char = pattern_bytes[i];
+            let text_char = text_bytes[i];
+            
+            if pattern_char.is_ascii_uppercase() && !text_char.is_ascii_uppercase() {
+                return false;
             }
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            for i in 0..self.pattern_len {
-                let pattern_char = unsafe { *pattern_bytes.get_unchecked(i) };
-                let text_char = unsafe { *text_bytes.get_unchecked(i) };
-                
-                // If pattern char is uppercase, text char must be uppercase
-                if pattern_char.is_ascii_uppercase() && !text_char.is_ascii_uppercase() {
-                    return false;
-                }
-                // If pattern char is lowercase, text char must be lowercase
-                if pattern_char.is_ascii_lowercase() && !text_char.is_ascii_lowercase() {
-                    return false;
-                }
+            if pattern_char.is_ascii_lowercase() && !text_char.is_ascii_lowercase() {
+                return false;
             }
         }
         true
     }
+}
+
+#[derive(Clone, Debug)]
+struct WalletData {
+    address: String,
+    private_key: String,
+    seed_phrase: String,
+}
+
+// BTC Address Generation
+fn generate_btc_address() -> Result<WalletData, Box<dyn std::error::Error>> {
+    // Generate entropy for 12-word mnemonic (128 bits = 16 bytes)
+    let mut entropy = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut entropy);
+    
+    // Generate mnemonic from entropy
+    let mnemonic = Mnemonic::from_entropy_in(Language::English, &entropy)?;
+    
+    // Generate seed from mnemonic
+    let seed = mnemonic.to_seed("");
+    
+    // Derive private key from seed (use first 32 bytes)
+    let mut priv_key_bytes = [0u8; 32];
+    priv_key_bytes.copy_from_slice(&seed[..32]);
+    
+    // Create bitcoin private key
+    let secp = BtcSecp256k1::new();
+    let secret_key = BtcSecretKey::from_slice(&priv_key_bytes)?;
+    let private_key = PrivateKey::new(secret_key, Network::Bitcoin);
+    
+    // Generate public key
+    let public_key = BtcPublicKey::from_private_key(&secp, &private_key);
+    
+    // Generate address (P2PKH)
+    let address = Address::p2pkh(&public_key, Network::Bitcoin);
+    
+    Ok(WalletData {
+        address: address.to_string(),
+        private_key: private_key.to_wif(),
+        seed_phrase: mnemonic.to_string(),
+    })
+}
+
+// ETH Address Generation
+fn generate_eth_address() -> Result<WalletData, Box<dyn std::error::Error>> {
+    // Generate entropy for 12-word mnemonic (128 bits = 16 bytes)
+    let mut entropy = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut entropy);
+    
+    // Generate mnemonic from entropy
+    let mnemonic = Mnemonic::from_entropy_in(Language::English, &entropy)?;
+    
+    // Generate seed from mnemonic
+    let seed = mnemonic.to_seed("");
+    
+    // Derive private key from seed (use first 32 bytes)
+    let mut priv_key_bytes = [0u8; 32];
+    priv_key_bytes.copy_from_slice(&seed[..32]);
+    
+    // Ensure valid private key
+    let secp = Secp256k1::new();
+    let secret_key = SecretKey::from_slice(&priv_key_bytes)?;
+    
+    // Generate public key
+    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
+    let public_key_bytes = public_key.serialize_uncompressed();
+    
+    // Hash public key with Keccak256
+    let hash = Keccak256::digest(&public_key_bytes[1..]); // Skip 0x04 prefix
+    let address_bytes = &hash[12..]; // Last 20 bytes
+    
+    // Format as hex address
+    let address = format!("0x{}", hex::encode(address_bytes));
+    
+    // Format private key as hex
+    let private_key = format!("0x{}", hex::encode(priv_key_bytes));
+    
+    Ok(WalletData {
+        address,
+        private_key,
+        seed_phrase: mnemonic.to_string(),
+    })
+}
+
+// XRP Address Generation
+fn generate_xrp_address() -> Result<WalletData, Box<dyn std::error::Error>> {
+    // Generate entropy for 12-word mnemonic (128 bits = 16 bytes)
+    let mut entropy = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut entropy);
+    
+    // Generate mnemonic from entropy
+    let mnemonic = Mnemonic::from_entropy_in(Language::English, &entropy)?;
+    
+    // Generate seed from mnemonic
+    let seed = mnemonic.to_seed("");
+    
+    // Derive private key from seed (use first 32 bytes)
+    let mut priv_key_bytes = [0u8; 32];
+    priv_key_bytes.copy_from_slice(&seed[..32]);
+    
+    // Ensure valid private key
+    let secp = Secp256k1::new();
+    let secret_key = SecretKey::from_slice(&priv_key_bytes)?;
+    
+    // Generate public key
+    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
+    let public_key_bytes = public_key.serialize_uncompressed();
+    
+    // XRP address encoding
+    // 1. Hash public key with SHA256
+    let sha256_hash = Sha256::digest(&public_key_bytes[1..]);
+    
+    // 2. Hash with RIPEMD160
+    let mut ripemd = Ripemd160::new();
+    ripemd.update(&sha256_hash);
+    let ripemd_hash = ripemd.finalize();
+    
+    // 3. Add version byte (0x00 for XRP)
+    let mut address_bytes = vec![0x00];
+    address_bytes.extend_from_slice(&ripemd_hash);
+    
+    // 4. Calculate checksum (double SHA256, take first 4 bytes)
+    let checksum1 = Sha256::digest(&address_bytes);
+    let checksum2 = Sha256::digest(&checksum1);
+    address_bytes.extend_from_slice(&checksum2[..4]);
+    
+    // 5. Base58 encode
+    let address = address_bytes.to_base58();
+    
+    // Format private key as hex
+    let private_key = format!("0x{}", hex::encode(priv_key_bytes));
+    
+    Ok(WalletData {
+        address,
+        private_key,
+        seed_phrase: mnemonic.to_string(),
+    })
+}
+
+// SOL Address Generation
+fn generate_sol_address() -> Result<WalletData, Box<dyn std::error::Error>> {
+    use solana_sdk::signature::{Keypair, Signer};
+    
+    // Generate entropy for 12-word mnemonic (128 bits = 16 bytes)
+    let mut entropy = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut entropy);
+    
+    // Generate mnemonic from entropy
+    let mnemonic = Mnemonic::from_entropy_in(Language::English, &entropy)?;
+    
+    // Generate seed from mnemonic
+    let seed = mnemonic.to_seed("");
+    
+    // Derive keypair from seed (Solana uses Ed25519)
+    // Use first 32 bytes of seed
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(&seed[..32]);
+    
+    // Create keypair from seed
+    let keypair = Keypair::from_bytes(&key_bytes)
+        .map_err(|_| "Failed to create keypair from seed")?;
+    
+    let address = keypair.pubkey().to_string();
+    let private_key = keypair.to_base58_string();
+    
+    Ok(WalletData {
+        address,
+        private_key,
+        seed_phrase: mnemonic.to_string(),
+    })
 }
 
 fn analyze_case_pattern(pattern: &str) -> (bool, bool, bool) {
@@ -181,17 +330,27 @@ fn analyze_case_pattern(pattern: &str) -> (bool, bool, bool) {
     (has_upper, has_lower, has_mixed)
 }
 
-fn save_to_json(address: &str, private_key: &str, attempts: u64, elapsed_time: std::time::Duration, 
-                prefix: Option<&str>, suffix: &str, case_mode: &str, filename: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn save_to_json(
+    wallet: &WalletData,
+    attempts: u64,
+    elapsed_time: std::time::Duration,
+    chain: &str,
+    pattern: Option<&str>,
+    pattern_type: &str,
+    case_mode: &str,
+    filename: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let now: DateTime<Utc> = Utc::now();
     
     let new_address = json!({
-        "address": address,
-        "private_key": private_key,
+        "chain": chain,
+        "address": wallet.address,
+        "private_key": wallet.private_key,
+        "seed_phrase": wallet.seed_phrase,
         "found_at": now.to_rfc3339(),
         "search_parameters": {
-            "prefix": prefix,
-            "suffix": suffix,
+            "pattern": pattern,
+            "pattern_type": pattern_type,
             "case_mode": case_mode
         },
         "search_stats": {
@@ -235,8 +394,10 @@ fn display_current_addresses(filename: &str) -> Result<(), Box<dyn std::error::E
                         println!("📚 Current addresses in {}: {}", filename, addresses.len());
                         for (i, addr) in addresses.iter().enumerate() {
                             if let Some(address) = addr["address"].as_str() {
-                                if let Some(found_at) = addr["found_at"].as_str() {
-                                    println!("   {}. {} (found: {})", i + 1, address, found_at);
+                                if let Some(chain) = addr["chain"].as_str() {
+                                    if let Some(found_at) = addr["found_at"].as_str() {
+                                        println!("   {}. [{}] {} (found: {})", i + 1, chain.to_uppercase(), address, found_at);
+                                    }
                                 }
                             }
                         }
@@ -252,62 +413,49 @@ fn display_current_addresses(filename: &str) -> Result<(), Box<dyn std::error::E
 fn main() {
     let args = Args::parse();
     
-    // Validate that at least one pattern is provided
-    if args.prefix.is_none() && args.suffix.is_empty() {
-        eprintln!("❌ Error: At least one of --prefix or --suffix must be specified");
+    // Validate chain
+    let chain = args.chain.to_lowercase();
+    if !["btc", "eth", "xrp", "sol"].contains(&chain.as_str()) {
+        eprintln!("❌ Error: Invalid chain. Must be one of: btc, eth, xrp, sol");
         std::process::exit(1);
     }
     
-    // Analyze the case pattern of the patterns
-    let suffix_analysis = if !args.suffix.is_empty() {
-        Some(analyze_case_pattern(&args.suffix))
+    // Validate that exactly one pattern is provided (prefix OR suffix, not both)
+    match (&args.prefix, &args.suffix) {
+        (Some(_), Some(_)) => {
+            eprintln!("❌ Error: Cannot specify both --prefix and --suffix. Use only one.");
+            std::process::exit(1);
+        }
+        (None, None) => {
+            eprintln!("❌ Error: Must specify either --prefix or --suffix");
+            std::process::exit(1);
+        }
+        _ => {}
+    }
+    
+    let (pattern, pattern_type) = if let Some(ref prefix) = args.prefix {
+        (prefix.clone(), "prefix")
     } else {
-        None
+        (args.suffix.clone().unwrap(), "suffix")
     };
     
-    let prefix_analysis = if let Some(ref prefix) = args.prefix {
-        Some(analyze_case_pattern(prefix))
-    } else {
-        None
-    };
+    // Analyze the case pattern
+    let pattern_analysis = analyze_case_pattern(&pattern);
     
-    println!("🔍 Searching for Solana vanity address:");
-    if let Some(ref prefix) = args.prefix {
-        println!("   📍 Starting with: {}", prefix);
-    }
-    if !args.suffix.is_empty() {
-        println!("   🎯 Ending with: {}", args.suffix);
-    }
+    println!("🔍 Searching for {} vanity address:", chain.to_uppercase());
+    println!("   🎯 Pattern: {} ({})", pattern, pattern_type);
     println!("📝 Case sensitive: {}", args.case_sensitive);
     println!("🎯 Case mode: {}", args.case_mode);
     
     // Print case analysis
-    if let Some((has_upper, has_lower, has_mixed)) = suffix_analysis {
-        println!("📊 Suffix case analysis:");
-        println!("   - Contains uppercase: {}", has_upper);
-        println!("   - Contains lowercase: {}", has_lower);
-        println!("   - Mixed case: {}", has_mixed);
-    }
+    let (has_upper, has_lower, has_mixed) = pattern_analysis;
+    println!("📊 Pattern case analysis:");
+    println!("   - Contains uppercase: {}", has_upper);
+    println!("   - Contains lowercase: {}", has_lower);
+    println!("   - Mixed case: {}", has_mixed);
     
-    if let Some((has_upper, has_lower, has_mixed)) = prefix_analysis {
-        println!("📊 Prefix case analysis:");
-        println!("   - Contains uppercase: {}", has_upper);
-        println!("   - Contains lowercase: {}", has_lower);
-        println!("   - Mixed case: {}", has_mixed);
-    }
-    
-    // Pre-compute optimized patterns
-    let optimized_suffix = if !args.suffix.is_empty() {
-        Some(OptimizedPattern::new(&args.suffix, &args.case_mode))
-    } else {
-        None
-    };
-    
-    let optimized_prefix = if let Some(ref prefix) = args.prefix {
-        Some(OptimizedPattern::new(prefix, &args.case_mode))
-    } else {
-        None
-    };
+    // Pre-compute optimized pattern
+    let optimized_pattern = OptimizedPattern::new(&pattern, &args.case_mode);
     
     // Clear output file if requested
     if args.clear_output {
@@ -325,18 +473,11 @@ fn main() {
         eprintln!("⚠️  Warning: Could not read output file: {}", e);
     }
     
-    // Set number of threads - use optimal thread count
+    // Set number of threads
     let num_threads = if args.threads == 0 {
-        // Use optimal thread count based on CPU cores and pattern complexity
         let cpu_cores = num_cpus::get();
-        let pattern_complexity = match (&optimized_prefix, &optimized_suffix) {
-            (Some(p), Some(s)) => p.pattern_len + s.pattern_len,
-            (Some(p), None) => p.pattern_len,
-            (None, Some(s)) => s.pattern_len,
-            _ => 1,
-        };
+        let pattern_complexity = optimized_pattern.pattern_len;
         
-        // More complex patterns benefit from more threads
         let optimal_threads = if pattern_complexity > 8 {
             cpu_cores * 2
         } else if pattern_complexity > 4 {
@@ -345,15 +486,15 @@ fn main() {
             cpu_cores.saturating_sub(1).max(1)
         };
         
-        optimal_threads.min(32) // Cap at 32 threads to avoid overhead
+        optimal_threads.min(32)
     } else {
         args.threads
     };
     
-    // Configure thread pool with optimal settings
+    // Configure thread pool
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
-        .stack_size(8 * 1024 * 1024) // 8MB stack size for better performance
+        .stack_size(8 * 1024 * 1024)
         .build_global()
         .unwrap();
     
@@ -363,14 +504,13 @@ fn main() {
     
     let start_time = Instant::now();
     let attempts = Arc::new(AtomicU64::new(0));
-    let found = Arc::new(AtomicU64::new(0));
     
-    // Create work chunks for better thread distribution
+    // Create work chunks
     let work_chunks: Vec<Vec<()>> = (0..num_threads)
         .map(|_| vec![(); args.chunk_size])
         .collect();
     
-    // Search for vanity address using parallel iterator with chunked work
+    // Search for vanity address
     let result = work_chunks
         .into_par_iter()
         .find_any(|_| {
@@ -385,91 +525,71 @@ fn main() {
                     return true;
                 }
                 
-                // Generate a new keypair
-                let keypair = Keypair::new();
-                let address = keypair.pubkey().to_string();
+                // Generate wallet based on chain
+                let wallet_result = match chain.as_str() {
+                    "btc" => generate_btc_address(),
+                    "eth" => generate_eth_address(),
+                    "xrp" => generate_xrp_address(),
+                    "sol" => generate_sol_address(),
+                    _ => unreachable!(),
+                };
                 
-                // Check if address matches both prefix and suffix patterns
+                let wallet = match wallet_result {
+                    Ok(w) => w,
+                    Err(_) => continue,
+                };
+                
+                // Check if address matches pattern
                 let matches = if args.case_sensitive {
-                    let prefix_matches = if let Some(ref prefix) = args.prefix {
-                        address.starts_with(prefix)
-                    } else {
-                        true
-                    };
-                    
-                    let suffix_matches = if !args.suffix.is_empty() {
-                        address.ends_with(&args.suffix)
-                    } else {
-                        true
-                    };
-                    
-                    prefix_matches && suffix_matches
+                    match pattern_type {
+                        "prefix" => wallet.address.starts_with(&pattern),
+                        "suffix" => wallet.address.ends_with(&pattern),
+                        _ => false,
+                    }
                 } else {
-                    let prefix_matches = if let Some(ref opt_prefix) = optimized_prefix {
-                        opt_prefix.matches(&address)
-                    } else {
-                        true
-                    };
-                    
-                    let suffix_matches = if let Some(ref opt_suffix) = optimized_suffix {
-                        opt_suffix.matches_suffix(&address)
-                    } else {
-                        true
-                    };
-                    
-                    prefix_matches && suffix_matches
+                    match pattern_type {
+                        "prefix" => optimized_pattern.matches(&wallet.address),
+                        "suffix" => optimized_pattern.matches_suffix(&wallet.address),
+                        _ => false,
+                    }
                 };
                 
                 if matches {
                     let total_attempts = attempts.fetch_add(local_attempts, Ordering::Relaxed) + local_attempts;
-                    found.store(total_attempts, Ordering::Relaxed);
                     
                     println!("🎉 Found matching address!");
-                    println!("📍 Address: {}", address);
-                    println!("🔑 Private key: [{}]", keypair.to_base58_string());
+                    println!("📍 Address: {}", wallet.address);
+                    println!("🔑 Private key: {}", wallet.private_key);
+                    println!("🌱 Seed phrase: {}", wallet.seed_phrase);
                     println!("📊 Attempts: {}", total_attempts);
                     println!("⏱️  Time taken: {:?}", start_time.elapsed());
                     
-                    // Show pattern analysis of the found address
-                    if let Some(ref prefix) = args.prefix {
-                        let found_prefix = &address[..prefix.len()];
-                        let (found_upper, found_lower, found_mixed) = analyze_case_pattern(found_prefix);
-                        println!("🔍 Found prefix analysis:");
-                        println!("   - Found prefix: {}", found_prefix);
-                        println!("   - Contains uppercase: {}", found_upper);
-                        println!("   - Contains lowercase: {}", found_lower);
-                        println!("   - Mixed case: {}", found_mixed);
-                    }
-                    
-                    if !args.suffix.is_empty() {
-                        let found_suffix = &address[address.len() - args.suffix.len()..];
-                        let (found_upper, found_lower, found_mixed) = analyze_case_pattern(found_suffix);
-                        println!("🔍 Found suffix analysis:");
-                        println!("   - Found suffix: {}", found_suffix);
-                        println!("   - Contains uppercase: {}", found_upper);
-                        println!("   - Contains lowercase: {}", found_lower);
-                        println!("   - Mixed case: {}", found_mixed);
-                    }
-                    
                     // Save data to JSON
                     let elapsed_time = start_time.elapsed();
-                    save_to_json(&address, &keypair.to_base58_string(), total_attempts, elapsed_time, 
-                                args.prefix.as_deref(), &args.suffix, &args.case_mode, &args.output).unwrap();
+                    save_to_json(
+                        &wallet,
+                        total_attempts,
+                        elapsed_time,
+                        &chain,
+                        Some(&pattern),
+                        pattern_type,
+                        &args.case_mode,
+                        &args.output,
+                    ).unwrap();
                     
                     return true;
                 }
                 
-                // Update global counter and progress less frequently for better performance
+                // Update global counter and progress
                 if local_attempts % 50_000 == 0 {
                     attempts.fetch_add(50_000, Ordering::Relaxed);
                     
-                    // Print progress every 5M attempts (reduced frequency for better performance)
                     let current_total = attempts.load(Ordering::Relaxed);
                     if current_total - last_progress >= 5_000_000 {
                         let elapsed = start_time.elapsed();
                         let rate = current_total as f64 / elapsed.as_secs_f64();
                         println!("🔍 Attempts: {} | Rate: {:.0}/sec | Current: {}", 
-                                current_total, rate, address);
+                                current_total, rate, wallet.address);
                         last_progress = current_total;
                     }
                 }
@@ -494,3 +614,4 @@ fn main() {
     println!("🚀 Final rate: {:.0} attempts/second", final_rate);
     println!("💡 Performance tip: Adjust --chunk-size and --threads for optimal performance");
 }
+
