@@ -5,8 +5,8 @@ A high-performance vanity address generator for Solana blockchain built with Rus
 ### Stay Connected
 | Platform | Link | Purpose |
 |----------|------|---------|
-| Telegram | [t.me/FroganBee.sol](https://t.me/froganbee_sol) | Announcements & Support |
-| X | [x.com/0xFortuneRust](https://x.com/0xFortuneRust) | News & Updates |
+| Telegram | [t.me/solzen33](https://t.me/solzen33) | Announcements & Support |
+| X | [x.com/solzen33](https://x.com/solzen33) | News & Updates |
 
 ## Features
 
